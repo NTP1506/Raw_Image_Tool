@@ -1,10 +1,12 @@
 import os
+import io
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 import cv2
 import numpy as np
 from PIL import ImageTk
+import requests
 
 from shared.constants import (
     FILETYPES,
@@ -37,11 +39,15 @@ class MainWindow:
 
         # State
         self._original_bgr: np.ndarray | None = None
+        self._pi_raw_bgr: np.ndarray | None = None
         self._pi_processed_bgr: np.ndarray | None = None  # After Pi pipeline
         self._processed_bgr: np.ndarray | None = None
         self._orig_photo: ImageTk.PhotoImage | None = None
         self._pi_photo: ImageTk.PhotoImage | None = None
         self._proc_photo: ImageTk.PhotoImage | None = None
+
+        self._source_mode = tk.StringVar(value="local")
+        self._pi_url = tk.StringVar(value="http://192.168.1.100:8088")
 
         self._build_ui()
 
@@ -67,6 +73,17 @@ class MainWindow:
         ttk.Button(top, text="Open Image", command=self._open_image).pack(side=tk.LEFT, padx=4)
         self._file_label = ttk.Label(top, text="No file loaded", foreground="#858585")
         self._file_label.pack(side=tk.LEFT, padx=10)
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+
+        ttk.Label(top, text="Pi URL").pack(side=tk.LEFT)
+        ttk.Entry(top, textvariable=self._pi_url, width=28).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Fetch Pi Frame", command=self._fetch_pi_frame).pack(side=tk.LEFT, padx=4)
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+        ttk.Label(top, text="Process Source").pack(side=tk.LEFT, padx=(2, 4))
+        ttk.Radiobutton(top, text="Local", variable=self._source_mode, value="local").pack(side=tk.LEFT)
+        ttk.Radiobutton(top, text="Pi RAW", variable=self._source_mode, value="pi_raw").pack(side=tk.LEFT)
 
         # Preview pane
         preview_frame = ttk.Frame(root, padding=(8, 0))
@@ -279,19 +296,81 @@ class MainWindow:
             return
 
         self._processed_bgr = None
+        self._pi_raw_bgr = None
         self._pi_processed_bgr = None
+        self._source_mode.set("local")
         self._file_label.config(text=os.path.basename(path))
         self._show_original(self._original_bgr)
         self._pi_canvas.delete("all")  # Clear Pi canvas
         self._clear_processed_canvas()  # Clear Processed canvas
 
-    def _process(self):
-        if self._original_bgr is None:
-            messagebox.showwarning("No Image", "Please open an image first.")
+    @staticmethod
+    def _demosaic_raw_for_preview(raw: np.ndarray, bayer_order: str) -> np.ndarray:
+        if raw.ndim == 3:
+            raw = raw[:, :, 0]
+
+        if raw.dtype != np.uint8:
+            raw_f = raw.astype(np.float32)
+            p1, p99 = np.percentile(raw_f, [1, 99])
+            raw_u8 = ((raw_f - p1) / max(p99 - p1, 1e-6) * 255.0)
+            raw_u8 = np.clip(raw_u8, 0, 255).astype(np.uint8)
+        else:
+            raw_u8 = raw
+
+        code_map = {
+            "BGGR": cv2.COLOR_BayerBG2BGR,
+            "RGGB": cv2.COLOR_BayerRG2BGR,
+            "GRBG": cv2.COLOR_BayerGR2BGR,
+            "GBRG": cv2.COLOR_BayerGB2BGR,
+        }
+        code = code_map.get((bayer_order or "").upper(), cv2.COLOR_BayerBG2BGR)
+        return cv2.cvtColor(raw_u8, code)
+
+    def _fetch_pi_frame(self):
+        base_url = self._pi_url.get().strip().rstrip("/")
+        if not base_url:
+            messagebox.showwarning("Pi URL Missing", "Please enter Pi URL first.")
             return
 
-        # Use Pi-processed image if available, otherwise use original
-        base_img = self._original_bgr
+        try:
+            isp_resp = requests.get(f"{base_url}/frame/isp.jpg", timeout=3)
+            isp_resp.raise_for_status()
+            isp_arr = np.frombuffer(isp_resp.content, dtype=np.uint8)
+            isp_bgr = cv2.imdecode(isp_arr, cv2.IMREAD_COLOR)
+            if isp_bgr is None:
+                raise RuntimeError("Cannot decode ISP JPEG from Pi.")
+
+            raw_resp = requests.get(f"{base_url}/frame/raw.npz", timeout=3)
+            raw_resp.raise_for_status()
+            payload = np.load(io.BytesIO(raw_resp.content), allow_pickle=False)
+            raw = payload["raw"]
+            bayer_order = str(payload["bayer_order"].item()) if "bayer_order" in payload else "BGGR"
+            raw_bgr = self._demosaic_raw_for_preview(raw, bayer_order)
+
+            self._pi_processed_bgr = isp_bgr
+            self._pi_raw_bgr = raw_bgr
+            self._processed_bgr = None
+            self._source_mode.set("pi_raw")
+
+            self._show_original(self._pi_raw_bgr)
+            self._show_pi_image(self._pi_processed_bgr)
+            self._clear_processed_canvas()
+            self._file_label.config(text=f"Pi frame: {base_url}")
+        except Exception as exc:
+            messagebox.showerror("Pi Fetch Error", str(exc))
+
+    def _process(self):
+        if self._source_mode.get() == "pi_raw":
+            if self._pi_raw_bgr is None:
+                messagebox.showwarning("No Pi RAW", "Fetch a Pi frame first.")
+                return
+            base_img = self._pi_raw_bgr
+        else:
+            if self._original_bgr is None:
+                messagebox.showwarning("No Image", "Please open an image first.")
+                return
+            base_img = self._original_bgr
+
         img = base_img.copy()
 
         # Adaptive boost for low-light scenes to improve object recall.
@@ -382,8 +461,11 @@ class MainWindow:
 
     def _reset(self):
         self._original_bgr = None
+        self._pi_raw_bgr = None
         self._pi_processed_bgr = None
         self._processed_bgr = None
+        self._source_mode.set("local")
+        self._file_label.config(text="No file loaded")
         self._orig_canvas.delete("all")
         self._pi_canvas.delete("all")
         self._proc_canvas.delete("all")
